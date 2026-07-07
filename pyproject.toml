@@ -1,0 +1,8 @@
+[project]
+name = "skillmine"
+version = "0.1.0"
+description = "Back up and sync Codex and Claude skills."
+requires-python = ">=3.11"
+
+[project.scripts]
+skillmine = "skillmine.cli:main"
