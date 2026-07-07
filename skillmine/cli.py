@@ -287,15 +287,56 @@ def selected_tools(args: argparse.Namespace) -> list[str]:
     return [args.root]
 
 
+def load_existing_manifest(repo: Path) -> dict[str, object]:
+    """Read an existing backup manifest, or an empty skeleton if none.
+
+    A backup vault can be written by more than one machine. The manifest is the
+    repo's index of what it holds, so a partial backup (`--root thufir`) must
+    MERGE into it, not overwrite the entries other machines/roots wrote. Returns
+    the parsed manifest with `roots`/`skills` present; on any read/parse error it
+    starts fresh (a corrupt index shouldn't block a backup).
+    """
+    manifest_path = repo / "skillmine-manifest.json"
+    if not manifest_path.exists():
+        return {"roots": {}, "skills": []}
+    try:
+        data = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"roots": {}, "skills": []}
+    if not isinstance(data, dict):
+        return {"roots": {}, "skills": []}
+    data.setdefault("roots", {})
+    data.setdefault("skills", [])
+    return data
+
+
+def merge_manifest(existing: dict[str, object], new_roots: dict[str, str], new_skills: list[dict]) -> dict[str, object]:
+    """Merge this run's roots+skills over an existing manifest, keyed by `dest`.
+
+    `dest` is the repo-relative identity of a backed-up skill, so same-dest
+    entries from this run replace their prior record while every other entry
+    (other roots, other machines) is preserved. Roots union the same way.
+    Does NOT prune skills whose source vanished — that's an explicit --prune
+    concern, out of scope here.
+    """
+    by_dest: dict[str, dict] = {entry["dest"]: entry for entry in existing.get("skills", []) if "dest" in entry}
+    for entry in new_skills:
+        by_dest[entry["dest"]] = entry
+    merged_roots = dict(existing.get("roots", {}))
+    merged_roots.update(new_roots)
+    return {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "roots": merged_roots,
+        "skills": sorted(by_dest.values(), key=lambda e: e["dest"]),
+    }
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     roots = roots_from_args(args)
     repo = expand_path(args.repo)
     tools = selected_tools(args)
-    manifest: dict[str, object] = {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "roots": {tool: str(roots[tool]) for tool in tools},
-        "skills": [],
-    }
+    new_roots = {tool: str(roots[tool]) for tool in tools}
+    new_skills: list[dict] = []
 
     planned: list[tuple[Skill, Path]] = []
     for tool in tools:
@@ -308,7 +349,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         for skill in discover_skills(tool, roots).values():
             dest = repo / "skills" / tool / skill.name
             planned.append((skill, dest))
-            manifest["skills"].append(
+            new_skills.append(
                 {
                     "tool": tool,
                     "name": skill.name,
@@ -330,6 +371,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         copy_skill(skill.path, dest)
 
+    manifest = merge_manifest(load_existing_manifest(repo), new_roots, new_skills)
     manifest_path = repo / "skillmine-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 

@@ -98,6 +98,73 @@ class ConfigRootTests(unittest.TestCase):
             cli.load_config_roots("/nonexistent/skillmine/config.json")
 
 
+class ManifestMergeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_roots = dict(cli.TOOL_ROOTS)
+        self._saved_tools = cli.TOOLS
+
+    def tearDown(self) -> None:
+        cli.TOOL_ROOTS.clear()
+        cli.TOOL_ROOTS.update(self._saved_roots)
+        cli.TOOLS = self._saved_tools
+
+    def test_merge_preserves_other_root_and_overwrites_same_dest(self) -> None:
+        existing = {
+            "roots": {"claude": "/Users/isagi/.claude/skills"},
+            "skills": [
+                {"tool": "claude", "name": "adapt", "source": "/Users/isagi/.claude/skills/adapt",
+                 "dest": "skills/claude/adapt", "sha256": "old-mac"},
+                {"tool": "thufir", "name": "occam", "source": "/root/thufir-skills/occam",
+                 "dest": "skills/thufir/occam", "sha256": "stale"},
+            ],
+        }
+        new_roots = {"thufir": "/root/thufir-skills"}
+        new_skills = [
+            {"tool": "thufir", "name": "occam", "source": "/root/thufir-skills/occam",
+             "dest": "skills/thufir/occam", "sha256": "fresh"},
+        ]
+        merged = cli.merge_manifest(existing, new_roots, new_skills)
+
+        dests = {e["dest"]: e for e in merged["skills"]}
+        self.assertEqual(dests["skills/claude/adapt"]["sha256"], "old-mac")
+        self.assertEqual(dests["skills/thufir/occam"]["sha256"], "fresh")
+        self.assertEqual(
+            merged["roots"],
+            {"claude": "/Users/isagi/.claude/skills", "thufir": "/root/thufir-skills"},
+        )
+
+    def test_partial_backup_does_not_drop_prior_manifest_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            repo.mkdir()
+            (repo / "skillmine-manifest.json").write_text(json.dumps({
+                "roots": {"claude": "/other/claude"},
+                "skills": [
+                    {"tool": "claude", "name": "a", "source": "/other/claude/a",
+                     "dest": "skills/claude/a", "sha256": "x"},
+                    {"tool": "claude", "name": "b", "source": "/other/claude/b",
+                     "dest": "skills/claude/b", "sha256": "y"},
+                ],
+            }))
+            lib = base / "lib" / "skills"
+            write_skill(lib, "lazy-qa", "# lazy-qa\n")
+            config = base / "config.json"
+            config.write_text(json.dumps({"roots": {"privatelib": str(lib)}}))
+
+            exit_code = run_cli([
+                "backup", "--config", str(config), "--repo", str(repo),
+                "--root", "privatelib", "--apply",
+            ])
+            self.assertEqual(exit_code, 0)
+
+            manifest = json.loads((repo / "skillmine-manifest.json").read_text())
+            dests = {e["dest"] for e in manifest["skills"]}
+            self.assertIn("skills/claude/a", dests)
+            self.assertIn("skills/claude/b", dests)
+            self.assertTrue(any(d.endswith("privatelib/lazy-qa") for d in dests))
+
+
 class SkillmineTests(unittest.TestCase):
     def test_sync_dry_run_does_not_copy_missing_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
