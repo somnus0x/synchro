@@ -13,14 +13,63 @@ from pathlib import Path
 from typing import Iterable
 
 
-TOOL_ROOTS = {
+DEFAULT_TOOL_ROOTS = {
     "codex": "~/.codex/skills",
     "claude": "~/.claude/skills",
     "factory": "~/.factory/skills",
     "agy": "~/.agents/skills",
 }
 
+# Runtime root map. Extended by ~/.skillmine/config.json custom roots so a machine
+# with skills in non-default locations (multiple skill repos, a monorepo dir) can
+# register them as first-class named sources/targets. Defaults are never overwritten.
+TOOL_ROOTS = dict(DEFAULT_TOOL_ROOTS)
+
 TOOLS = tuple(TOOL_ROOTS)
+
+DEFAULT_CONFIG_PATH = "~/.skillmine/config.json"
+
+
+def load_config_roots(config_path: str | None) -> dict[str, str]:
+    """Read custom named roots from a skillmine config file.
+
+    Config shape:
+        {"roots": {"thufir": "/root/thufir-skills", "lib": "/root/lib/skills"}}
+
+    Returns an empty dict when the file is absent (config is optional). A custom
+    root whose name collides with a built-in tool is refused, so config can only
+    ADD roots, never silently rebind codex/claude/factory/agy.
+    """
+    path = expand_path(config_path or DEFAULT_CONFIG_PATH)
+    if not path.exists():
+        if config_path is not None:
+            raise SystemExit(f"config not found: {path}")
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SystemExit(f"invalid config {path}: {exc}")
+    roots = data.get("roots", {})
+    if not isinstance(roots, dict):
+        raise SystemExit(f"invalid config {path}: 'roots' must be an object")
+    custom: dict[str, str] = {}
+    for name, value in roots.items():
+        if name in DEFAULT_TOOL_ROOTS:
+            raise SystemExit(
+                f"invalid config {path}: '{name}' collides with a built-in tool; "
+                "custom roots must use a distinct name"
+            )
+        if not isinstance(value, str):
+            raise SystemExit(f"invalid config {path}: root '{name}' must be a string path")
+        custom[name] = value
+    return custom
+
+
+def register_custom_roots(custom: dict[str, str]) -> None:
+    """Merge custom roots into the runtime TOOL_ROOTS / TOOLS tables."""
+    global TOOLS
+    TOOL_ROOTS.update(custom)
+    TOOLS = tuple(TOOL_ROOTS)
 
 EXCLUDES = {
     ".git",
@@ -456,6 +505,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def add_root_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=f"skillmine config file with custom named roots (default: {DEFAULT_CONFIG_PATH})",
+    )
     for tool, default in TOOL_ROOTS.items():
         parser.add_argument(f"--{tool}-root", default=default)
     parser.add_argument(
@@ -513,6 +567,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Peek at --config before the real parse so custom roots are registered in
+    # time to appear as valid --root / --from / --to choices and --*-root flags.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    pre_args, _ = pre.parse_known_args(argv)
+    register_custom_roots(load_config_roots(pre_args.config))
+
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

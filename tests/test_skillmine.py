@@ -37,6 +37,67 @@ def run_cli(args: list[str]) -> int:
         return cli.main(args)
 
 
+class ConfigRootTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_roots = dict(cli.TOOL_ROOTS)
+        self._saved_tools = cli.TOOLS
+
+    def tearDown(self) -> None:
+        cli.TOOL_ROOTS.clear()
+        cli.TOOL_ROOTS.update(self._saved_roots)
+        cli.TOOLS = self._saved_tools
+
+    def test_config_registers_custom_root_as_backup_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            lib = base / "lib" / "skills"
+            write_skill(lib, "lazy-qa", "# lazy-qa\n")
+            repo = base / "arsenal"
+
+            config = base / "config.json"
+            config.write_text(json.dumps({"roots": {"privatelib": str(lib)}}))
+
+            exit_code = run_cli(
+                [
+                    "backup",
+                    "--config",
+                    str(config),
+                    "--repo",
+                    str(repo),
+                    "--root",
+                    "privatelib",
+                    "--apply",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((repo / "skills" / "privatelib" / "lazy-qa" / "SKILL.md").exists())
+
+    def test_config_refuses_builtin_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "config.json"
+            config.write_text(json.dumps({"roots": {"claude": "/somewhere"}}))
+            with self.assertRaises(SystemExit):
+                cli.load_config_roots(str(config))
+
+    def test_default_config_absent_returns_empty(self) -> None:
+        # No explicit --config and the default file absent => optional, empty.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_default = Path(tmp) / "does-not-exist.json"
+            original = cli.DEFAULT_CONFIG_PATH
+            cli.DEFAULT_CONFIG_PATH = str(missing_default)
+            try:
+                self.assertEqual(cli.load_config_roots(None), {})
+            finally:
+                cli.DEFAULT_CONFIG_PATH = original
+
+    def test_explicit_missing_config_errors(self) -> None:
+        # An explicitly-passed --config that doesn't exist must fail loud.
+        with self.assertRaises(SystemExit):
+            cli.load_config_roots("/nonexistent/skillmine/config.json")
+
+
 class SkillmineTests(unittest.TestCase):
     def test_sync_dry_run_does_not_copy_missing_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
