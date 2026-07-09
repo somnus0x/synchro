@@ -287,6 +287,25 @@ def selected_tools(args: argparse.Namespace) -> list[str]:
     return [args.root]
 
 
+def normalize_manifest_dest(dest: object, repo: Path) -> str | None:
+    if not isinstance(dest, str) or not dest:
+        return None
+
+    path = Path(dest)
+    if not path.is_absolute():
+        return path.as_posix()
+
+    try:
+        return path.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        pass
+
+    parts = path.parts
+    if "skills" not in parts:
+        return dest
+    return Path(*parts[parts.index("skills"):]).as_posix()
+
+
 def load_existing_manifest(repo: Path) -> dict[str, object]:
     """Read an existing backup manifest, or an empty skeleton if none.
 
@@ -307,6 +326,16 @@ def load_existing_manifest(repo: Path) -> dict[str, object]:
         return {"roots": {}, "skills": []}
     data.setdefault("roots", {})
     data.setdefault("skills", [])
+    normalized_skills = []
+    for entry in data["skills"]:
+        if not isinstance(entry, dict):
+            continue
+        normalized = dict(entry)
+        normalized_dest = normalize_manifest_dest(normalized.get("dest"), repo)
+        if normalized_dest:
+            normalized["dest"] = normalized_dest
+        normalized_skills.append(normalized)
+    data["skills"] = normalized_skills
     return data
 
 
@@ -347,14 +376,15 @@ def cmd_backup(args: argparse.Namespace) -> int:
             print(f"skip missing root: {tool} -> {roots[tool]}")
             continue
         for skill in discover_skills(tool, roots).values():
-            dest = repo / "skills" / tool / skill.name
+            repo_dest = Path("skills") / tool / skill.name
+            dest = repo / repo_dest
             planned.append((skill, dest))
             new_skills.append(
                 {
                     "tool": tool,
                     "name": skill.name,
                     "source": str(skill.path),
-                    "dest": str(dest),
+                    "dest": repo_dest.as_posix(),
                     "sha256": skill.digest,
                 }
             )

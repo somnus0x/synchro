@@ -164,6 +164,35 @@ class ManifestMergeTests(unittest.TestCase):
             self.assertIn("skills/claude/b", dests)
             self.assertTrue(any(d.endswith("privatelib/lazy-qa") for d in dests))
 
+    def test_backup_normalizes_absolute_manifest_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            repo.mkdir()
+            (repo / "skillmine-manifest.json").write_text(json.dumps({
+                "roots": {"codex": "/old/.codex/skills"},
+                "skills": [
+                    {"tool": "codex", "name": "one", "source": "/old/.codex/skills/one",
+                     "dest": "/Users/old/Development/arsenal/skills/codex/one",
+                     "sha256": "old"},
+                ],
+            }))
+            codex = base / "codex"
+            write_skill(codex, "one", "# One\n")
+
+            exit_code = run_cli([
+                "backup", "--repo", str(repo), "--root", "codex",
+                *root_args(base), "--apply",
+            ])
+            self.assertEqual(exit_code, 0)
+
+            manifest = json.loads((repo / "skillmine-manifest.json").read_text())
+            self.assertEqual(
+                [entry["dest"] for entry in manifest["skills"]],
+                ["skills/codex/one"],
+            )
+            self.assertNotEqual(manifest["skills"][0]["sha256"], "old")
+
 
 class SkillmineTests(unittest.TestCase):
     def test_sync_dry_run_does_not_copy_missing_skill(self) -> None:
