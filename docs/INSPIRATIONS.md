@@ -1,6 +1,6 @@
 # Inspirations
 
-Skillmine borrows product patterns from existing tools. It does not copy their
+Synchro borrows product patterns from existing tools. It does not copy their
 implementation.
 
 ## Agent Skill Tools
@@ -12,7 +12,7 @@ implementation.
   validation, and skillsets.
   Source: https://arxiv.org/abs/2604.16911
 - Factory Droid skills: separate personal skills from plugin-managed skills.
-  Borrowed idea: Skillmine can read plugin-managed skills, but should not write
+  Borrowed idea: Synchro can read plugin-managed skills, but should not write
   over them as if they were personal files.
   Sources:
   - https://docs.factory.ai/cli/configuration/skills
@@ -38,4 +38,4 @@ implementation.
 - Plugin-managed Droid skills are readable backup sources, not overwrite targets.
 - Conflict handling stops by default; `--force` must be explicit and still makes
   a timestamped backup.
-- Skillmine never pushes.
+- Synchro never pushes.
