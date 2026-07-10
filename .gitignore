@@ -10,3 +10,4 @@ build/
 .claude/settings.local.json
 drift-audit-*.md
 kanly-post-extraction.md
+.DS_Store

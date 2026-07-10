@@ -536,7 +536,9 @@ class SynchroTests(unittest.TestCase):
             self.assertTrue((backed_up / "reference.txt").is_symlink())
             self.assertTrue((backed_up / "loop").is_symlink())
 
-    def test_backup_rejects_top_level_skill_symlink_outside_source_root(self) -> None:
+    def test_backup_skips_top_level_skill_symlink_outside_source_root(self) -> None:
+        # An escaping skill symlink is skipped (not copied), and the command
+        # still succeeds — it must not abort discovery for every other skill.
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             codex = base / "codex"
@@ -551,7 +553,7 @@ class SynchroTests(unittest.TestCase):
                 *root_args(base), "--apply",
             ])
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             self.assertFalse((repo / "skills" / "codex" / "alias").exists())
 
     def test_backup_rejects_symlinked_vault_root(self) -> None:
@@ -783,7 +785,9 @@ class SynchroTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual((repo / "skills" / "factory" / "review" / "SKILL.md").read_text(), "# Review\n")
 
-    def test_factory_rejects_plugin_skill_symlink_outside_plugin_root(self) -> None:
+    def test_factory_skips_plugin_skill_symlink_outside_plugin_root(self) -> None:
+        # An escaping plugin-skill symlink is skipped (not copied); the command
+        # still succeeds rather than aborting the whole factory discovery.
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "vault"
@@ -798,7 +802,7 @@ class SynchroTests(unittest.TestCase):
                 *root_args(base), "--apply",
             ])
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             self.assertFalse((repo / "skills" / "factory" / "alias").exists())
 
     def test_factory_rejects_symlinked_plugin_outside_marketplace(self) -> None:
@@ -999,6 +1003,165 @@ class SynchroTests(unittest.TestCase):
             self.assertFalse((backed_up / "settings.local.json").exists())
             self.assertFalse((backed_up / "module.pyo").exists())
             self.assertFalse((backed_up / ".pytest_cache").exists())
+
+
+class UpgradeRegressionTests(unittest.TestCase):
+    """Guards for the gpt5.6 upgrade regressions found in code review 974fe8f."""
+
+    def setUp(self) -> None:
+        self._saved_roots = dict(cli.TOOL_ROOTS)
+
+    def tearDown(self) -> None:
+        cli.TOOL_ROOTS.clear()
+        cli.TOOL_ROOTS.update(self._saved_roots)
+
+    def test_config_accepts_dotted_and_underscore_root_names(self) -> None:
+        # Names old skillmine accepted must still load — the stricter regex plus
+        # the new legacy fallback would otherwise brick every command.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"roots": {"my.skills": "/a", "_local": "/b"}}))
+            self.assertEqual(
+                cli.load_config_roots(str(config)),
+                {"my.skills": "/a", "_local": "/b"},
+            )
+
+    def test_traversal_root_names_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            for name in ("..", ".", "../escape", "a/b"):
+                with self.subTest(name=name):
+                    config.write_text(json.dumps({"roots": {name: "/tmp/x"}}))
+                    with self.assertRaises(SystemExit):
+                        cli.load_config_roots(str(config))
+
+    def test_case_variant_secret_is_excluded(self) -> None:
+        self.assertTrue(cli.is_excluded(".ENV"))
+        self.assertTrue(cli.is_excluded(".Env.Production"))
+        self.assertTrue(cli.is_excluded("Settings.Local.json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            skill = write_skill(base / "codex", "one", "# One\n")
+            (skill / ".ENV").write_text("SECRET=1\n")
+
+            exit_code = run_cli([
+                "backup", "--repo", str(repo), "--root", "codex",
+                *root_args(base), "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((repo / "skills" / "codex" / "one" / ".ENV").exists())
+
+    def test_sync_force_does_not_copy_secret_into_backup_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            write_skill(base / "codex", "one", "# Source\n")
+            target = write_skill(base / "claude", "one", "# Target\n")
+            (target / ".env.local").write_text("SECRET=1\n")
+            backup_dir = base / "backups"
+
+            exit_code = run_cli([
+                "sync", "--from", "codex", "--to", "claude",
+                *root_args(base), "--backup-dir", str(backup_dir), "--force", "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            # The displaced target was preserved, but its secret was not.
+            self.assertTrue(list(backup_dir.rglob("SKILL.md")))
+            self.assertEqual(list(backup_dir.rglob(".env.local")), [])
+
+    def test_looping_symlink_is_skipped_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            codex = base / "codex"
+            codex.mkdir()
+            os.symlink("loop", codex / "loop")  # self-referential -> ELOOP on resolve
+            write_skill(codex, "real", "# Real\n")
+
+            exit_code = run_cli(["audit", "--root", "codex", *root_args(base)])
+
+            self.assertEqual(exit_code, 0)
+
+    def test_regular_file_named_plugins_or_skills_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            marketplaces = base / "factory-plugins"
+            (marketplaces / "market1").mkdir(parents=True)
+            (marketplaces / "market1" / "plugins").write_text("not a dir\n")
+            good_skills = marketplaces / "market2" / "plugins" / "core" / "skills"
+            good_skills.mkdir(parents=True)
+            write_skill(good_skills, "good", "# Good\n")
+            broken = marketplaces / "market2" / "plugins" / "broken"
+            broken.mkdir()
+            (broken / "skills").write_text("not a dir\n")
+
+            exit_code = run_cli(["audit", "--root", "factory", *root_args(base)])
+
+            self.assertEqual(exit_code, 0)
+
+    def test_backup_commit_untracked_legacy_manifest_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            cli.ensure_git_repo(repo)
+            cli.run_git(repo, "config", "user.name", "Synchro Tests")
+            cli.run_git(repo, "config", "user.email", "synchro@example.invalid")
+            # Legacy manifest present but NEVER tracked in git.
+            (repo / cli.LEGACY_MANIFEST_NAME).write_text(json.dumps({"roots": {}, "skills": []}))
+            write_skill(base / "codex", "one", "# One\n")
+
+            exit_code = run_cli([
+                "backup", "--repo", str(repo), "--root", "codex",
+                *root_args(base), "--apply", "--commit",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((repo / cli.LEGACY_MANIFEST_NAME).exists())
+            self.assertTrue((repo / "skills" / "codex" / "one" / "SKILL.md").exists())
+
+    def test_backup_commit_stages_legacy_deletion_from_prior_apply_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            cli.ensure_git_repo(repo)
+            cli.run_git(repo, "config", "user.name", "Synchro Tests")
+            cli.run_git(repo, "config", "user.email", "synchro@example.invalid")
+            (repo / cli.LEGACY_MANIFEST_NAME).write_text(json.dumps({"roots": {}, "skills": []}))
+            cli.run_git(repo, "add", cli.LEGACY_MANIFEST_NAME)
+            cli.run_git(repo, "commit", "-m", "legacy manifest")
+            write_skill(base / "codex", "one", "# One\n")
+
+            # run 1: --apply without --commit migrates (unlinks) the tracked file.
+            run_cli([
+                "backup", "--repo", str(repo), "--root", "codex",
+                *root_args(base), "--apply",
+            ])
+            self.assertFalse((repo / cli.LEGACY_MANIFEST_NAME).exists())
+
+            # run 2: --commit must still commit that deletion (old gate skipped it).
+            exit_code = run_cli([
+                "backup", "--repo", str(repo), "--root", "codex",
+                *root_args(base), "--apply", "--commit",
+            ])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(cli.run_git(repo, "status", "--short").stdout, "")
+            self.assertNotIn(cli.LEGACY_MANIFEST_NAME, cli.run_git(repo, "ls-files").stdout)
+
+    def test_manifest_dest_with_literal_backslash_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            dest = "skills/claude/my\\thing"
+            # A POSIX name with a literal backslash must not be Windows-rewritten.
+            self.assertEqual(cli.normalize_manifest_dest(dest, repo), dest)
+
+    def test_transient_manifest_read_error_does_not_clobber(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            manifest = repo / cli.MANIFEST_NAME
+            manifest.mkdir()  # a directory at the manifest path -> read_text raises OSError
+            with self.assertRaises(cli.SynchroError):
+                cli.load_manifest_file(manifest, repo)
 
 
 if __name__ == "__main__":

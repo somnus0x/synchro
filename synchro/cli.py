@@ -35,7 +35,12 @@ LEGACY_CONFIG_PATH = "~/.skillmine/config.json"
 MANIFEST_NAME = "synchro-manifest.json"
 LEGACY_MANIFEST_NAME = "skillmine-manifest.json"
 
-CUSTOM_ROOT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# Path-safe custom root name: must start with an alnum or underscore and use
+# only alnum/dot/underscore/hyphen thereafter. This blocks path separators and
+# ".."/"." traversal (a root name is a vault path component: skills/<name>/...)
+# while still accepting the names old skillmine allowed (e.g. "my.skills",
+# "_local") so migrated/legacy configs don't hard-fail every command.
+CUSTOM_ROOT_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 RESERVED_ROOT_NAMES = {"all", "factory_plugins", "factory-plugins"}
 BUILTIN_ROOT_NAMES_CASEFOLDED = {name.casefold() for name in DEFAULT_TOOL_ROOTS}
 RESERVED_ROOT_NAMES_CASEFOLDED = {name.casefold() for name in RESERVED_ROOT_NAMES}
@@ -88,8 +93,9 @@ def load_config_roots(config_path: str | None) -> dict[str, str]:
             raise SystemExit(f"invalid config {path}: root name '{name}' collides by case")
         if not CUSTOM_ROOT_NAME.fullmatch(name):
             raise SystemExit(
-                f"invalid config {path}: root name '{name}' must contain only "
-                "letters, numbers, underscores, and hyphens"
+                f"invalid config {path}: root name '{name}' must start with a "
+                "letter, number, or underscore and contain only letters, "
+                "numbers, dots, underscores, and hyphens"
             )
         if not isinstance(value, str) or not value.strip():
             raise SystemExit(f"invalid config {path}: root '{name}' must be a string path")
@@ -136,7 +142,12 @@ def expand_path(value: str | Path) -> Path:
 
 
 def is_excluded(name: str) -> bool:
-    return any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDES)
+    # fnmatch applies os.path.normcase, which is identity on POSIX — so plain
+    # fnmatch is case-sensitive on macOS/Linux and ".ENV" would slip past
+    # ".env*". Lowercase both sides so secret-file exclusion holds for case
+    # variants (critical on case-insensitive filesystems like APFS).
+    lowered = name.lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in EXCLUDES)
 
 
 def iter_skill_files(skill_dir: Path) -> Iterable[Path]:
@@ -198,12 +209,23 @@ def discover_flat_skills(tool: str, root: Path, managed: bool = False) -> dict[s
         if entry.is_symlink():
             try:
                 resolved_entry = entry.resolve(strict=True)
-            except (FileNotFoundError, RuntimeError):
+            except (OSError, RuntimeError):
+                # Broken symlink, or a loop (ELOOP raises OSError on 3.11+, the
+                # package's own floor — the old RuntimeError catch never fired).
+                # Skip it rather than crash every command with a raw traceback.
                 continue
             if not resolved_entry.is_dir() or not (resolved_entry / "SKILL.md").exists():
                 continue
             if not is_within(resolved_entry, resolved_root):
-                raise SynchroError(f"refusing skill symlink outside root: {entry} -> {resolved_entry}")
+                # A skill symlinked in from outside its root (common dotfiles
+                # setup) is skipped with a warning, not fatal — one such entry
+                # must not abort read-only audit/doctor or drop every other
+                # skill from a backup.
+                print(
+                    f"warning: skipping skill symlink outside root: {entry} -> {resolved_entry}",
+                    file=sys.stderr,
+                )
+                continue
         elif not entry.is_dir() or not (entry / "SKILL.md").exists():
             continue
         skills[entry.name] = make_skill(tool, entry.name, entry, managed=managed)
@@ -215,7 +237,7 @@ def discover_factory_plugin_skills(plugin_root: Path) -> dict[str, Skill]:
     if (plugin_root / "plugins").is_dir():
         marketplace_roots = [plugin_root]
     elif plugin_root.is_dir():
-        marketplace_roots = [entry for entry in sorted(plugin_root.iterdir(), key=lambda p: p.name) if (entry / "plugins").exists()]
+        marketplace_roots = [entry for entry in sorted(plugin_root.iterdir(), key=lambda p: p.name) if (entry / "plugins").is_dir()]
     else:
         marketplace_roots = []
 
@@ -242,7 +264,7 @@ def discover_factory_plugin_skills(plugin_root: Path) -> dict[str, Skill]:
                     f"refusing plugin outside marketplace: {plugin_dir} -> {resolved_plugin_dir}"
                 )
             skills_dir = plugin_dir / "skills"
-            if not skills_dir.exists():
+            if not skills_dir.is_dir():
                 continue
             resolved_skills_dir = skills_dir.resolve()
             if not is_within(resolved_skills_dir, resolved_plugin_dir):
@@ -255,14 +277,16 @@ def discover_factory_plugin_skills(plugin_root: Path) -> dict[str, Skill]:
                 if entry.is_symlink():
                     try:
                         resolved_entry = entry.resolve(strict=True)
-                    except (FileNotFoundError, RuntimeError):
+                    except (OSError, RuntimeError):
                         continue
                     if not resolved_entry.is_dir() or not (resolved_entry / "SKILL.md").exists():
                         continue
                     if not is_within(resolved_entry, resolved_skills_dir):
-                        raise SynchroError(
-                            f"refusing plugin skill symlink outside root: {entry} -> {resolved_entry}"
+                        print(
+                            f"warning: skipping plugin skill symlink outside root: {entry} -> {resolved_entry}",
+                            file=sys.stderr,
                         )
+                        continue
                 elif not entry.is_dir() or not (entry / "SKILL.md").exists():
                     continue
                 skills.setdefault(entry.name, make_skill("factory", entry.name, entry, managed=True))
@@ -377,13 +401,18 @@ def copy_skill(src: Path, dest: Path) -> None:
 
 
 def backup_existing_path(src: Path, dest: Path) -> None:
-    """Preserve a displaced target exactly, including local-only files."""
+    """Preserve a displaced target, excluding secret/cache files (EXCLUDES).
+
+    This is the pre-overwrite safety copy for sync/restore --force. It MUST honor
+    the same exclusion list as copy_skill, or .env*/settings.local.json get
+    duplicated into ~/.synchro/backups (which accumulates with no retention).
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.is_symlink():
         dest.symlink_to(os.readlink(src), target_is_directory=src.is_dir())
     elif src.is_dir():
-        shutil.copytree(src, dest, symlinks=True)
-    else:
+        shutil.copytree(src, dest, symlinks=True, ignore=copy_ignore)
+    elif not is_excluded(src.name):
         shutil.copy2(src, dest, follow_symlinks=False)
 
 
@@ -419,11 +448,21 @@ def ensure_git_repo(repo: Path) -> None:
         )
 
 
+def git_tracks(repo: Path, name: str) -> bool:
+    """True if `name` is tracked in the vault index (even if deleted from the
+    worktree). Lets the caller stage a removed legacy manifest's deletion without
+    a fatal unmatched-pathspec `git add` when the file was never tracked."""
+    result = run_git(repo, "ls-files", "--", name, check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def commit_paths(repo: Path, paths: list[str], message: str) -> bool:
     """Commit only managed paths without consuming unrelated index entries."""
     literal_environment = os.environ.copy()
     literal_environment["GIT_LITERAL_PATHSPECS"] = "1"
-    run_git(repo, "add", "--all", "--", *paths, env=literal_environment)
+    # Staging into the REAL index happens only after a successful commit (below).
+    # The old code added here first, which clobbered content the user hand-staged
+    # under a managed path even when there was ultimately nothing to commit.
 
     descriptor, index_name = tempfile.mkstemp(prefix="synchro-index-")
     os.close(descriptor)
@@ -453,6 +492,11 @@ def commit_paths(repo: Path, paths: list[str], message: str) -> bool:
         if diff.returncode != 1:
             raise SynchroError(f"git diff failed: {diff.stderr.strip()}")
         run_git(repo, "commit", "-m", message, env=environment)
+        # Sync the real index for just the committed paths so `git status` is
+        # clean afterward (no phantom staged-deletions vs the new HEAD). Reached
+        # only when we actually committed, so it never touches a path — or a
+        # user's staging of one — that this backup left alone.
+        run_git(repo, "add", "--all", "--", *paths, env=literal_environment)
         return True
     finally:
         if temporary_index.exists():
@@ -526,7 +570,11 @@ def normalize_manifest_dest(dest: object, repo: Path) -> str | None:
                 return Path(*parts[index:]).as_posix()
         return None
 
-    if "\\" in dest:
+    # Only treat a dest as Windows when it has NO forward slash: this module
+    # always writes dests via as_posix() (forward slashes), so a value with both
+    # separators is a POSIX path holding a literal backslash in a component, not
+    # a Windows path — rewriting it would break dest-keyed manifest merging.
+    if "\\" in dest and "/" not in dest:
         windows_path = PureWindowsPath(dest)
         suffix = skills_suffix(windows_path.parts)
         if suffix:
@@ -554,8 +602,16 @@ def load_manifest_file(manifest_path: Path, repo: Path) -> dict[str, object]:
     if not manifest_path.exists():
         return {"roots": {}, "skills": []}
     try:
-        data = json.loads(manifest_path.read_text())
-    except (json.JSONDecodeError, OSError):
+        raw = manifest_path.read_text()
+    except OSError as exc:
+        # A transient read error must NOT silently return an empty index — that
+        # drops every entry other roots/machines recorded (the clobber
+        # regression fixed in 8a37734, resurfacing through the error path).
+        raise SynchroError(f"cannot read manifest {manifest_path}: {exc}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # A corrupt (unparseable) index shouldn't block a backup — start fresh.
         return {"roots": {}, "skills": []}
     if not isinstance(data, dict):
         return {"roots": {}, "skills": []}
@@ -738,7 +794,13 @@ def cmd_backup(args: argparse.Namespace) -> int:
     if args.commit:
         managed_paths = sorted(entry["dest"] for entry in new_skills)
         managed_paths.append(MANIFEST_NAME)
-        if migrate_legacy_manifest:
+        # Stage the legacy manifest's removal only when git actually tracks it.
+        # Untracked (fresh vault, or prior --apply-without-commit runs) → adding
+        # it makes `git add -- skillmine-manifest.json` fatal on an unmatched
+        # pathspec. Tracked-but-already-deleted (migrate flag consumed in an
+        # earlier run) → its deletion still needs committing, which the old
+        # `if migrate_legacy_manifest` gate skipped.
+        if git_tracks(repo, LEGACY_MANIFEST_NAME):
             managed_paths.append(LEGACY_MANIFEST_NAME)
         if not commit_paths(repo, managed_paths, args.message):
             print("git: no backup changes to commit")
@@ -1003,6 +1065,12 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except SynchroError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        # git failed under check=True; surface its captured stderr instead of a
+        # bare traceback so the real cause (e.g. "Author identity unknown") shows.
+        detail = (exc.stderr or "").strip() or f"command failed: {' '.join(str(a) for a in exc.cmd)}"
+        print(f"error: git: {detail}", file=sys.stderr)
         return 1
 
 
