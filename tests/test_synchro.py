@@ -56,7 +56,7 @@ class ConfigRootTests(unittest.TestCase):
             repo = base / "arsenal"
 
             config = base / "config.json"
-            config.write_text(json.dumps({"roots": {"privatelib": str(lib)}}))
+            config.write_text(json.dumps({"roots": {"shared": str(lib)}}))
 
             exit_code = run_cli(
                 [
@@ -66,13 +66,13 @@ class ConfigRootTests(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--root",
-                    "privatelib",
+                    "shared",
                     "--apply",
                 ]
             )
 
             self.assertEqual(exit_code, 0)
-            self.assertTrue((repo / "skills" / "privatelib" / "lazy-qa" / "SKILL.md").exists())
+            self.assertTrue((repo / "skills" / "shared" / "lazy-qa" / "SKILL.md").exists())
 
     def test_config_refuses_builtin_name_collision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -199,27 +199,27 @@ class ManifestMergeTests(unittest.TestCase):
 
     def test_merge_preserves_other_root_and_overwrites_same_dest(self) -> None:
         existing = {
-            "roots": {"claude": "/Users/isagi/.claude/skills"},
+            "roots": {"claude": "/Users/dev/.claude/skills"},
             "skills": [
-                {"tool": "claude", "name": "adapt", "source": "/Users/isagi/.claude/skills/adapt",
+                {"tool": "claude", "name": "adapt", "source": "/Users/dev/.claude/skills/adapt",
                  "dest": "skills/claude/adapt", "sha256": "old-mac"},
-                {"tool": "thufir", "name": "occam", "source": "/root/thufir-skills/occam",
-                 "dest": "skills/thufir/occam", "sha256": "stale"},
+                {"tool": "myskills", "name": "occam", "source": "/opt/skills/occam",
+                 "dest": "skills/myskills/occam", "sha256": "stale"},
             ],
         }
-        new_roots = {"thufir": "/root/thufir-skills"}
+        new_roots = {"myskills": "/opt/skills"}
         new_skills = [
-            {"tool": "thufir", "name": "occam", "source": "/root/thufir-skills/occam",
-             "dest": "skills/thufir/occam", "sha256": "fresh"},
+            {"tool": "myskills", "name": "occam", "source": "/opt/skills/occam",
+             "dest": "skills/myskills/occam", "sha256": "fresh"},
         ]
         merged = cli.merge_manifest(existing, new_roots, new_skills)
 
         dests = {e["dest"]: e for e in merged["skills"]}
         self.assertEqual(dests["skills/claude/adapt"]["sha256"], "old-mac")
-        self.assertEqual(dests["skills/thufir/occam"]["sha256"], "fresh")
+        self.assertEqual(dests["skills/myskills/occam"]["sha256"], "fresh")
         self.assertEqual(
             merged["roots"],
-            {"claude": "/Users/isagi/.claude/skills", "thufir": "/root/thufir-skills"},
+            {"claude": "/Users/dev/.claude/skills", "myskills": "/opt/skills"},
         )
 
     def test_partial_backup_does_not_drop_prior_manifest_entries(self) -> None:
@@ -239,11 +239,11 @@ class ManifestMergeTests(unittest.TestCase):
             lib = base / "lib" / "skills"
             write_skill(lib, "lazy-qa", "# lazy-qa\n")
             config = base / "config.json"
-            config.write_text(json.dumps({"roots": {"privatelib": str(lib)}}))
+            config.write_text(json.dumps({"roots": {"shared": str(lib)}}))
 
             exit_code = run_cli([
                 "backup", "--config", str(config), "--repo", str(repo),
-                "--root", "privatelib", "--apply",
+                "--root", "shared", "--apply",
             ])
             self.assertEqual(exit_code, 0)
 
@@ -251,7 +251,7 @@ class ManifestMergeTests(unittest.TestCase):
             dests = {e["dest"] for e in manifest["skills"]}
             self.assertIn("skills/claude/a", dests)
             self.assertIn("skills/claude/b", dests)
-            self.assertTrue(any(d.endswith("privatelib/lazy-qa") for d in dests))
+            self.assertTrue(any(d.endswith("shared/lazy-qa") for d in dests))
 
     def test_backup_normalizes_absolute_manifest_destinations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
