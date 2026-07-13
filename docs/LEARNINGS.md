@@ -23,6 +23,16 @@ Key takeaway: shared physical roots must be processed once; syncing between
 `codex` and `agy` is a no-op, and legacy Codex user skills must be consolidated
 with `migrate-codex` rather than copied between the two roots.
 
+### Empty migration plans must exit before snapshot setup
+
+After consolidation, the legacy root can still exist because Codex's `.system`
+directory remains. An applied rerun then has no user-skill copy to create the
+snapshot parent, so falling through to `snapshot.json` setup raises a filesystem
+error instead of behaving idempotently.
+
+Key takeaway: a migration with a valid but empty plan should return success
+before initializing backup artifacts or mutation state.
+
 ## File Safety
 
 ### An excluded recovery file becomes deleted data

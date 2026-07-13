@@ -1046,6 +1046,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         and args.target != "factory"
         and roots_are_shared(roots[args.source], roots[args.target])
     ):
+        if args.name:
+            source_skills = discover_skills(args.source, roots)
+            missing_names = sorted(set(args.name) - source_skills.keys())
+            for name in missing_names:
+                print(f"missing source: {args.source}/{name}")
+            if missing_names:
+                print(f"summary: actions=0 conflicts=0 missing={len(missing_names)}")
+                return 1
         print(
             f"shared root: {args.source} and {args.target} -> {roots[args.source]}; "
             "nothing to copy"
@@ -1208,6 +1216,11 @@ def cmd_migrate_codex(args: argparse.Namespace) -> int:
             f"conflicts={conflicts} missing={missing}"
         )
         return 2 if conflicts else 1
+
+    if not plans:
+        print(f"no legacy user skills found in {legacy_root}; nothing to migrate")
+        print("summary: moved=0 duplicates_removed=0 conflicts=0 missing=0")
+        return 0
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     snapshot_root = backup_base / timestamp / "pre-codex-migration"

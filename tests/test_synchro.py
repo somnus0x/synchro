@@ -409,6 +409,22 @@ class SynchroTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
 
+    def test_sync_between_shared_roots_validates_requested_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = base / "shared"
+            write_skill(shared, "one", "# One\n")
+
+            exit_code = run_cli([
+                "sync", "--from", "codex", "--to", "agy", "--name", "absent",
+                *root_args(base),
+                "--codex-root", str(shared),
+                "--agy-root", str(shared),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 1)
+
     def test_shared_personal_root_does_not_hide_factory_plugin_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -474,6 +490,25 @@ class SynchroTests(unittest.TestCase):
             self.assertTrue((legacy / "unique").exists())
             self.assertFalse((shared / "unique").exists())
             self.assertFalse((base / "backups").exists())
+
+    def test_migrate_codex_apply_with_no_user_skills_is_a_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            system = write_skill(legacy / ".system", "bundled", "# Bundled\n")
+            backups = base / "backups"
+
+            exit_code = run_cli([
+                "migrate-codex",
+                "--legacy-root", str(legacy),
+                "--shared-root", str(base / "shared"),
+                "--backup-dir", str(backups),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(system.exists())
+            self.assertFalse(backups.exists())
 
     def test_migrate_codex_preflight_conflict_prevents_all_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

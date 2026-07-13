@@ -130,7 +130,8 @@ The migration:
 - leaves Codex's bundled `~/.codex/skills/.system` directory untouched
 
 It never chooses a winner for a conflict. Resolve the two copies manually, then
-rerun the migration.
+rerun the migration. Applied reruns are idempotent: when no legacy user skills
+remain, Synchro exits successfully without creating an empty snapshot.
 
 ## Roots
 
