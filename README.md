@@ -74,14 +74,14 @@ monorepo `skills/` dir, a private library — register them once in
 ```json
 {
   "roots": {
-    "thufir": "/root/thufir-skills",
-    "privatelib": "/root/private-loop-library/skills"
+    "myskills": "/path/to/skills-repo",
+    "shared": "/path/to/shared-skills"
   }
 }
 ```
 
 Custom roots become first-class named tools everywhere: `audit`, `doctor`,
-`backup --root thufir`, `sync --from privatelib --to codex`, etc. They only ADD
+`backup --root myskills`, `sync --from shared --to codex`, etc. They only ADD
 roots — a name that collides with a built-in (`codex`/`claude`/`factory`/`agy`)
 is refused, so config can never silently rebind a default. Override the config
 path with `--config`; an explicit `--config` that's missing is an error, while

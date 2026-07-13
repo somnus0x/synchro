@@ -59,7 +59,7 @@ def load_config_roots(config_path: str | None) -> dict[str, str]:
     """Read custom named roots from a Synchro config file.
 
     Config shape:
-        {"roots": {"thufir": "/root/thufir-skills", "lib": "/root/lib/skills"}}
+        {"roots": {"myskills": "/path/to/skills-repo", "lib": "/path/to/lib/skills"}}
 
     Returns an empty dict when the file is absent (config is optional). A custom
     root whose name collides with a built-in tool is refused, so config can only
@@ -780,7 +780,7 @@ def load_existing_manifest(repo: Path) -> dict[str, object]:
     """Read current and legacy manifests, merging current records last.
 
     A backup vault can be written by more than one machine. The manifest is the
-    repo's index of what it holds, so a partial backup (`--root thufir`) must
+    repo's index of what it holds, so a partial backup (`--root myskills`) must
     MERGE into it, not overwrite the entries other machines/roots wrote. Returns
     the parsed manifest with `roots`/`skills` present; on any read/parse error it
     starts fresh (a corrupt index shouldn't block a backup).
