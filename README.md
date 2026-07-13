@@ -5,14 +5,15 @@ syncing skills between local agent installs.
 
 MVP scope:
 
-- audit Codex, Claude, Factory/Droid, and Agy skill roots
+- audit Codex/Antigravity's shared agent-skills root plus Claude and Factory/Droid
 - back up skill directories into a git-backed vault
 - restore skill directories from a git-backed vault
 - sync missing or explicitly forced skills from one install to another
 - default to dry-run; writes require `--apply`
 - never push
 - never dereference nested symlinks into a backup
-- never copy `.env*`, `settings.local.json`, `.git`, caches, or bytecode into a vault or synced skill
+- never copy `.env*`, common credential/key files, local settings, `.git`, caches,
+  or bytecode into a vault or synced skill
 
 ## Install
 
@@ -38,21 +39,31 @@ python3 -m synchro backup --repo ~/agent-skill-vault
 python3 -m synchro backup --repo ~/agent-skill-vault --apply --commit -m "backup skills"
 python3 -m synchro restore --repo ~/agent-skill-vault --from codex --to claude
 python3 -m synchro sync --from codex --to claude
-python3 -m synchro sync --from claude --to agy --name mirror-sync
+python3 -m synchro sync --from claude --to codex --name mirror-sync
 python3 -m synchro sync --from factory --to codex --apply
+python3 -m synchro migrate-codex
+python3 -m synchro migrate-codex --apply
 python3 -m synchro doctor
 ```
 
 `sync` copies only missing skills by default. If a skill already exists at the
 target with different bytes, Synchro reports a conflict and skips it. To
 replace a conflicted target skill, pass `--force`; Synchro first writes a
-timestamped, complete copy of the displaced target under
-`~/.synchro/backups`. Local recovery backups are not Git-backed and retain
-local-only files that are excluded from normal sync and vault copies.
+timestamped recovery copy of its non-excluded content under
+`~/.synchro/backups`. An occupied path that is not a valid skill also requires
+`--force`. Synchro refuses replacement when the target contains protected local
+data such as `.env*`, credentials, private keys, `.git`, or `.venv`; move those
+entries intentionally before retrying. Disposable caches may be omitted from a
+recovery copy.
 
 `restore` follows the same safety rules as `sync`, but uses a Synchro backup
 repo as the source. It is the cross-machine path: clone/pull your vault, run a
 dry-run restore, then apply only the roots or skill names you want.
+
+Codex and Antigravity (`agy`) share `~/.agents/skills` by default. A sync
+between `codex` and `agy` is therefore a no-op, and aggregate audit/backup
+commands process that physical root once. The two CLI names remain available
+for compatibility and for explicit nonstandard root overrides.
 
 ## Custom roots (config file)
 
@@ -97,17 +108,44 @@ python3 -m pip uninstall skillmine
 python3 -m pip install .
 ```
 
+## Legacy Codex Skill Migration
+
+Codex now discovers user skills from `~/.agents/skills`. Older installs may
+also contain user-skill copies under `~/.codex/skills`, which makes matching
+skills appear twice. Consolidate them with a dry run first:
+
+```bash
+python3 -m synchro migrate-codex
+python3 -m synchro migrate-codex --apply
+```
+
+The migration:
+
+- moves skills found only in `~/.codex/skills` into `~/.agents/skills`
+- removes byte-identical legacy copies
+- writes and hash-verifies a complete pre-migration snapshot under
+  `~/.synchro/backups` before changing any live skill
+- aborts before all changes when it finds a differing skill or an excluded
+  local-only file
+- leaves Codex's bundled `~/.codex/skills/.system` directory untouched
+
+It never chooses a winner for a conflict. Resolve the two copies manually, then
+rerun the migration.
+
 ## Roots
 
 Default roots:
 
 | Tool | Path |
 | --- | --- |
-| Codex | `~/.codex/skills` |
+| Codex | `~/.agents/skills` |
+| Antigravity (`agy`) | `~/.agents/skills` (shared with Codex) |
 | Claude | `~/.claude/skills` |
 | Factory/Droid personal skills | `~/.factory/skills` |
 | Factory/Droid plugin skills | `~/.factory/plugins/marketplaces/*/plugins/*/skills` |
-| Agy | `~/.agents/skills` |
+
+`~/.codex/skills` is treated only as a legacy migration source for user skills.
+Synchro does not use it as Codex's default write target.
 
 `factory` uses Droid CLI's personal skill root as its write target. Synchro
 also reads installed Droid plugin skills for audit and backup, but it refuses to
@@ -128,6 +166,9 @@ python3 -m synchro audit \
   --agy-root /tmp/agy-skills
 ```
 
+Giving `--codex-root` and `--agy-root` different paths intentionally restores
+separate-install behavior. With the defaults, both names address one folder.
+
 ## Git Backup
 
 `backup --apply` creates the repo path if needed, initializes git when no
@@ -138,9 +179,12 @@ skills/
   codex/<skill-name>/
   claude/<skill-name>/
   factory/<skill-name>/
-  agy/<skill-name>/
 synchro-manifest.json
 ```
+
+An aggregate backup records the shared Codex/Agy root once under `codex/`.
+An explicit `backup --root agy` remains supported and uses `agy/` for backward
+compatibility with existing vaults.
 
 `--commit` stages and commits only the skill directories copied by that run and
 the manifest. It does not push. Pre-existing staged files and edits under other
@@ -151,6 +195,11 @@ does not read or copy their target bytes. A top-level skill symlink that escapes
 its configured root is rejected. A backup is also rejected before any write
 when its source and destination overlap, when the vault's `skills/` root is a
 symlink, or when the resolved destination would escape the vault.
+
+Synchro excludes common secret-bearing filenames, including credential JSON,
+private-key/keystore formats, SSH key names, token files, cloud config folders,
+and Terraform state. It does not inspect ordinary file contents for secrets;
+do not store credentials under innocuous filenames inside a skill.
 
 ## Exit Codes
 
@@ -183,4 +232,8 @@ See [docs/INSPIRATIONS.md](docs/INSPIRATIONS.md).
 - no global `AGENTS.md` or `CLAUDE.md` sync yet
 - no automatic scheduled sync
 - no bidirectional merge of conflicting skills
-- no secrets or local settings in Git vaults or synced copies
+- no automatic secret-content scanner; filename-based exclusions are the MVP boundary
+
+## License
+
+MIT. See [LICENSE](LICENSE).

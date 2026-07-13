@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from synchro import cli
 
@@ -381,6 +382,200 @@ class ManifestMergeTests(unittest.TestCase):
 
 
 class SynchroTests(unittest.TestCase):
+    def test_codex_and_agy_share_the_default_user_root(self) -> None:
+        self.assertEqual(
+            cli.DEFAULT_TOOL_ROOTS["codex"],
+            cli.DEFAULT_TOOL_ROOTS["agy"],
+        )
+
+    def test_sync_between_shared_roots_is_a_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = base / "shared"
+            write_skill(shared, "one", "# One\n")
+
+            with mock.patch.object(
+                cli,
+                "copy_skill",
+                side_effect=AssertionError("shared-root sync must not copy"),
+            ):
+                exit_code = run_cli([
+                    "sync", "--from", "codex", "--to", "agy",
+                    *root_args(base),
+                    "--codex-root", str(shared),
+                    "--agy-root", str(shared),
+                    "--apply",
+                ])
+
+            self.assertEqual(exit_code, 0)
+
+    def test_shared_personal_root_does_not_hide_factory_plugin_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = base / "shared"
+            shared.mkdir()
+            write_skill(
+                base / "factory-plugins" / "plugins" / "core" / "skills",
+                "review",
+                "# Plugin Review\n",
+            )
+
+            exit_code = run_cli([
+                "sync", "--from", "factory", "--to", "codex",
+                *root_args(base),
+                "--factory-root", str(shared),
+                "--codex-root", str(shared),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                (shared / "review" / "SKILL.md").read_text(),
+                "# Plugin Review\n",
+            )
+
+    def test_backup_all_writes_shared_root_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = base / "shared"
+            repo = base / "vault"
+            write_skill(shared, "one", "# One\n")
+
+            exit_code = run_cli([
+                "backup", "--repo", str(repo),
+                *root_args(base),
+                "--codex-root", str(shared),
+                "--agy-root", str(shared),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((repo / "skills" / "codex" / "one" / "SKILL.md").exists())
+            self.assertFalse((repo / "skills" / "agy").exists())
+
+    def test_migrate_codex_dry_run_does_not_change_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            shared = base / "shared"
+            write_skill(legacy, "duplicate", "# Same\n")
+            write_skill(shared, "duplicate", "# Same\n")
+            write_skill(legacy, "unique", "# Unique\n")
+
+            exit_code = run_cli([
+                "migrate-codex",
+                "--legacy-root", str(legacy),
+                "--shared-root", str(shared),
+                "--backup-dir", str(base / "backups"),
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((legacy / "duplicate").exists())
+            self.assertTrue((legacy / "unique").exists())
+            self.assertFalse((shared / "unique").exists())
+            self.assertFalse((base / "backups").exists())
+
+    def test_migrate_codex_preflight_conflict_prevents_all_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            shared = base / "shared"
+            backups = base / "backups"
+            write_skill(legacy, "duplicate", "# Same\n")
+            write_skill(shared, "duplicate", "# Same\n")
+            write_skill(legacy, "unique", "# Unique\n")
+            write_skill(legacy, "conflict", "# Legacy\n")
+            write_skill(shared, "conflict", "# Shared\n")
+
+            exit_code = run_cli([
+                "migrate-codex",
+                "--legacy-root", str(legacy),
+                "--shared-root", str(shared),
+                "--backup-dir", str(backups),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue((legacy / "duplicate").exists())
+            self.assertTrue((legacy / "unique").exists())
+            self.assertFalse((shared / "unique").exists())
+            self.assertTrue((legacy / "conflict").exists())
+            self.assertEqual((shared / "conflict" / "SKILL.md").read_text(), "# Shared\n")
+            self.assertFalse(backups.exists())
+
+    def test_migrate_codex_snapshots_before_merging_and_removing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            shared = base / "shared"
+            backups = base / "backups"
+            write_skill(legacy, "duplicate", "# Same\n")
+            write_skill(shared, "duplicate", "# Same\n")
+            write_skill(legacy, "unique", "# Unique\n")
+
+            exit_code = run_cli([
+                "migrate-codex",
+                "--legacy-root", str(legacy),
+                "--shared-root", str(shared),
+                "--backup-dir", str(backups),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((legacy / "duplicate").exists())
+            self.assertFalse((legacy / "unique").exists())
+            self.assertEqual((shared / "duplicate" / "SKILL.md").read_text(), "# Same\n")
+            self.assertEqual((shared / "unique" / "SKILL.md").read_text(), "# Unique\n")
+            snapshots = list(backups.glob("*/pre-codex-migration"))
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(len(list((snapshots[0] / "legacy").rglob("SKILL.md"))), 2)
+            self.assertTrue((snapshots[0] / "snapshot.json").exists())
+
+    def test_migrate_codex_snapshot_failure_prevents_live_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            shared = base / "shared"
+            write_skill(legacy, "duplicate", "# Same\n")
+            write_skill(shared, "duplicate", "# Same\n")
+
+            with mock.patch.object(
+                cli,
+                "copy_skill",
+                side_effect=cli.SynchroError("snapshot failed"),
+            ):
+                exit_code = run_cli([
+                    "migrate-codex",
+                    "--legacy-root", str(legacy),
+                    "--shared-root", str(shared),
+                    "--backup-dir", str(base / "backups"),
+                    "--apply",
+                ])
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue((legacy / "duplicate").exists())
+            self.assertTrue((shared / "duplicate").exists())
+
+    def test_migrate_codex_refuses_skill_with_local_only_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / "legacy"
+            skill = write_skill(legacy, "local", "# Local\n")
+            (skill / "__pycache__").mkdir()
+            (skill / "__pycache__" / "state").write_text("local\n")
+
+            exit_code = run_cli([
+                "migrate-codex",
+                "--legacy-root", str(legacy),
+                "--shared-root", str(base / "shared"),
+                "--backup-dir", str(base / "backups"),
+                "--apply",
+            ])
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(skill.exists())
+            self.assertFalse((base / "shared" / "local").exists())
+
     def test_sync_dry_run_does_not_copy_missing_skill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -458,7 +653,7 @@ class SynchroTests(unittest.TestCase):
 
             exit_code = run_cli([
                 "sync", "--from", "codex", "--to", "claude",
-                "--backup-dir", str(backup_dir), *root_args(base), "--apply",
+                "--backup-dir", str(backup_dir), *root_args(base), "--force", "--apply",
             ])
 
             self.assertEqual(exit_code, 0)
@@ -466,6 +661,23 @@ class SynchroTests(unittest.TestCase):
             backups = list(backup_dir.glob("*/claude/one"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(), "blocking file\n")
+
+    def test_sync_refuses_file_target_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            write_skill(base / "codex", "one", "# One\n")
+            claude = base / "claude"
+            claude.mkdir()
+            blocking_file = claude / "one"
+            blocking_file.write_text("blocking file\n")
+
+            exit_code = run_cli([
+                "sync", "--from", "codex", "--to", "claude",
+                *root_args(base), "--apply",
+            ])
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(blocking_file.read_text(), "blocking file\n")
 
     def test_conflicting_skill_is_not_replaced_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -939,6 +1151,25 @@ class SynchroTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             self.assertEqual((claude / "one" / "SKILL.md").read_text(), "# Local\n")
 
+    def test_restore_force_refuses_target_with_protected_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "vault"
+            claude = base / "claude"
+            write_skill(repo / "skills" / "codex", "one", "# Backup\n")
+            target = write_skill(claude, "one", "# Local\n")
+            protected = target / "credentials.json"
+            protected.write_text('{"token":"secret"}\n')
+
+            exit_code = run_cli([
+                "restore", "--repo", str(repo), "--from", "codex", "--to", "claude",
+                *root_args(base), "--force", "--apply",
+            ])
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual((target / "SKILL.md").read_text(), "# Local\n")
+            self.assertTrue(protected.exists())
+
     def test_restore_requested_missing_skill_returns_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -980,6 +1211,9 @@ class SynchroTests(unittest.TestCase):
             skill = write_skill(codex, "one", "# One\n")
             (skill / ".envrc").write_text("SECRET=1\n")
             (skill / "settings.local.json").write_text("{}\n")
+            (skill / "credentials.json").write_text('{"token":"secret"}\n')
+            (skill / "client_secret.prod.json").write_text('{"secret":"value"}\n')
+            (skill / "private.pem").write_text("private key\n")
             (skill / "module.pyo").write_text("bytecode\n")
             (skill / ".pytest_cache").mkdir()
             (skill / ".pytest_cache" / "state").write_text("cache\n")
@@ -1001,6 +1235,9 @@ class SynchroTests(unittest.TestCase):
             self.assertTrue((backed_up / "SKILL.md").exists())
             self.assertFalse((backed_up / ".envrc").exists())
             self.assertFalse((backed_up / "settings.local.json").exists())
+            self.assertFalse((backed_up / "credentials.json").exists())
+            self.assertFalse((backed_up / "client_secret.prod.json").exists())
+            self.assertFalse((backed_up / "private.pem").exists())
             self.assertFalse((backed_up / "module.pyo").exists())
             self.assertFalse((backed_up / ".pytest_cache").exists())
 
@@ -1039,6 +1276,8 @@ class UpgradeRegressionTests(unittest.TestCase):
         self.assertTrue(cli.is_excluded(".ENV"))
         self.assertTrue(cli.is_excluded(".Env.Production"))
         self.assertTrue(cli.is_excluded("Settings.Local.json"))
+        self.assertTrue(cli.is_protected("Credentials.JSON"))
+        self.assertTrue(cli.is_protected("PRIVATE.PEM"))
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo = base / "vault"
@@ -1053,7 +1292,7 @@ class UpgradeRegressionTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertFalse((repo / "skills" / "codex" / "one" / ".ENV").exists())
 
-    def test_sync_force_does_not_copy_secret_into_backup_dir(self) -> None:
+    def test_sync_force_refuses_target_with_protected_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             write_skill(base / "codex", "one", "# Source\n")
@@ -1066,10 +1305,30 @@ class UpgradeRegressionTests(unittest.TestCase):
                 *root_args(base), "--backup-dir", str(backup_dir), "--force", "--apply",
             ])
 
-            self.assertEqual(exit_code, 0)
-            # The displaced target was preserved, but its secret was not.
-            self.assertTrue(list(backup_dir.rglob("SKILL.md")))
+            self.assertEqual(exit_code, 2)
+            self.assertEqual((target / "SKILL.md").read_text(), "# Target\n")
+            self.assertTrue((target / ".env.local").exists())
+            self.assertEqual(list(backup_dir.rglob("SKILL.md")), [])
             self.assertEqual(list(backup_dir.rglob(".env.local")), [])
+
+    def test_sync_force_allows_disposable_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            write_skill(base / "codex", "one", "# Source\n")
+            target = write_skill(base / "claude", "one", "# Target\n")
+            cache = target / ".pytest_cache"
+            cache.mkdir()
+            (cache / "state").write_text("disposable\n")
+
+            exit_code = run_cli([
+                "sync", "--from", "codex", "--to", "claude",
+                *root_args(base), "--backup-dir", str(base / "backups"),
+                "--force", "--apply",
+            ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual((target / "SKILL.md").read_text(), "# Source\n")
+            self.assertFalse(cache.exists())
 
     def test_looping_symlink_is_skipped_not_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

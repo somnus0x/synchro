@@ -17,11 +17,16 @@ from typing import Iterable
 
 
 DEFAULT_TOOL_ROOTS = {
-    "codex": "~/.codex/skills",
+    # Codex and Antigravity both implement the agent-skills user root. Keeping
+    # separate defaults makes one physical skill appear twice in Codex because
+    # Codex also discovers ~/.agents/skills.
+    "codex": "~/.agents/skills",
     "claude": "~/.claude/skills",
     "factory": "~/.factory/skills",
     "agy": "~/.agents/skills",
 }
+
+LEGACY_CODEX_ROOT = "~/.codex/skills"
 
 # Runtime root map. Extended by ~/.synchro/config.json custom roots so a machine
 # with skills in non-default locations (multiple skill repos, a monorepo dir) can
@@ -112,20 +117,51 @@ def register_custom_roots(custom: dict[str, str]) -> None:
     TOOL_ROOTS.update(custom)
     TOOLS = tuple(TOOL_ROOTS)
 
-EXCLUDES = {
+PROTECTED_EXCLUDES = {
     ".git",
+    ".aws",
+    ".gcloud",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".ssh",
+    ".venv",
+    "*.jks",
+    "*.key",
+    "*.keystore",
+    "*.p12",
+    "*.pem",
+    "*.pfx",
+    "*service-account*.json",
+    "*service_account*.json",
+    ".env*",
+    "client_secret*.json",
+    "credentials.json",
+    "credentials.*.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "secret.*",
+    "secrets.*",
+    "settings.local.json",
+    "terraform.tfstate*",
+    "token.json",
+    "tokens.json",
+}
+
+DISPOSABLE_EXCLUDES = {
     ".DS_Store",
     "__pycache__",
     "*.pyc",
     "*.pyo",
-    ".env*",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
     ".synchro-*",
-    ".venv",
-    "settings.local.json",
 }
+
+EXCLUDES = PROTECTED_EXCLUDES | DISPOSABLE_EXCLUDES
 
 
 @dataclass(frozen=True)
@@ -141,13 +177,21 @@ def expand_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def is_excluded(name: str) -> bool:
+def matches_patterns(name: str, patterns: Iterable[str]) -> bool:
     # fnmatch applies os.path.normcase, which is identity on POSIX — so plain
     # fnmatch is case-sensitive on macOS/Linux and ".ENV" would slip past
     # ".env*". Lowercase both sides so secret-file exclusion holds for case
     # variants (critical on case-insensitive filesystems like APFS).
     lowered = name.lower()
-    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in EXCLUDES)
+    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in patterns)
+
+
+def is_excluded(name: str) -> bool:
+    return matches_patterns(name, EXCLUDES)
+
+
+def is_protected(name: str) -> bool:
+    return matches_patterns(name, PROTECTED_EXCLUDES)
 
 
 def iter_skill_files(skill_dir: Path) -> Iterable[Path]:
@@ -307,6 +351,46 @@ def roots_from_args(args: argparse.Namespace) -> dict[str, Path]:
     return roots
 
 
+def roots_are_shared(left: Path, right: Path) -> bool:
+    """True when two tool names resolve to the same physical skill root."""
+    if left == right:
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def unique_tools_by_root(
+    tools: Iterable[str],
+    roots: dict[str, Path],
+) -> tuple[list[str], dict[str, str]]:
+    """Collapse tool aliases that point at one install root.
+
+    The first tool remains the canonical label for aggregate operations. An
+    explicitly selected single tool is therefore preserved, while `all` avoids
+    auditing or backing up the same install twice.
+    """
+    unique: list[str] = []
+    aliases: dict[str, str] = {}
+    for tool in tools:
+        owner = next(
+            (
+                candidate
+                for candidate in unique
+                if tool != "factory"
+                and candidate != "factory"
+                and roots_are_shared(roots[tool], roots[candidate])
+            ),
+            None,
+        )
+        if owner is None:
+            unique.append(tool)
+        else:
+            aliases[tool] = owner
+    return unique, aliases
+
+
 def tool_root_exists(tool: str, roots: dict[str, Path]) -> bool:
     if roots[tool].is_dir():
         return True
@@ -401,11 +485,11 @@ def copy_skill(src: Path, dest: Path) -> None:
 
 
 def backup_existing_path(src: Path, dest: Path) -> None:
-    """Preserve a displaced target, excluding secret/cache files (EXCLUDES).
+    """Preserve a displaced target, excluding entries matched by EXCLUDES.
 
-    This is the pre-overwrite safety copy for sync/restore --force. It MUST honor
-    the same exclusion list as copy_skill, or .env*/settings.local.json get
-    duplicated into ~/.synchro/backups (which accumulates with no retention).
+    Sync/restore must refuse targets containing PROTECTED_EXCLUDES before calling
+    this helper. The supported replacement path can therefore omit disposable
+    caches without either duplicating secrets or deleting protected local data.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.is_symlink():
@@ -418,6 +502,31 @@ def backup_existing_path(src: Path, dest: Path) -> None:
 
 def copy_ignore(_dir: str, names: list[str]) -> set[str]:
     return {name for name in names if is_excluded(name)}
+
+
+def find_matching_entries(skill_dir: Path, patterns: Iterable[str]) -> list[Path]:
+    """List matching entries without reading their contents or following links."""
+    if skill_dir.is_symlink() or not skill_dir.is_dir():
+        return []
+    root = skill_dir
+    excluded: list[Path] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for child in current.iterdir():
+            if matches_patterns(child.name, patterns):
+                excluded.append(child.relative_to(root))
+            elif child.is_dir() and not child.is_symlink():
+                stack.append(child)
+    return sorted(excluded)
+
+
+def find_excluded_entries(skill_dir: Path) -> list[Path]:
+    return find_matching_entries(skill_dir, EXCLUDES)
+
+
+def find_protected_entries(skill_dir: Path) -> list[Path]:
+    return find_matching_entries(skill_dir, PROTECTED_EXCLUDES)
 
 
 def run_git(
@@ -506,7 +615,12 @@ def commit_paths(repo: Path, paths: list[str], message: str) -> bool:
 def cmd_audit(args: argparse.Namespace) -> int:
     roots = roots_from_args(args)
     active_tools = selected_tools(args)
-    all_skills = {tool: discover_skills(tool, roots) for tool in active_tools}
+    unique_tools, aliases = unique_tools_by_root(active_tools, roots)
+    discovered = {tool: discover_skills(tool, roots) for tool in unique_tools}
+    all_skills = {
+        tool: discovered[aliases.get(tool, tool)]
+        for tool in active_tools
+    }
 
     for tool in active_tools:
         root = roots[tool]
@@ -517,7 +631,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
             status = f"{status}, {plugin_count} plugin skills"
         print(f"{tool}: {root} ({status})")
 
-    comparable_tools = [tool for tool in active_tools if roots[tool].exists() or all_skills[tool]]
+    comparable_candidates = [
+        tool for tool in active_tools if roots[tool].exists() or all_skills[tool]
+    ]
+    comparable_tools = [tool for tool in comparable_candidates if tool not in aliases]
+    for alias, owner in aliases.items():
+        print(f"shared root: {alias} -> {roots[alias]} (same as {owner})")
+
     if len(comparable_tools) < 2:
         count = sum(len(all_skills[tool]) for tool in comparable_tools)
         print(f"summary: roots={len(comparable_tools)} skills={count} drift=0")
@@ -741,6 +861,10 @@ def cmd_backup(args: argparse.Namespace) -> int:
         print(f"missing root: {args.root} -> {roots[args.root]}", file=sys.stderr)
         return 1
 
+    tools, aliases = unique_tools_by_root(tools, roots)
+    for alias, owner in aliases.items():
+        print(f"skip shared root: {alias} -> {roots[alias]} (backed up as {owner})")
+
     new_roots = {tool: str(roots[tool]) for tool in tools}
     new_skills: list[dict] = []
 
@@ -845,8 +969,17 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
         target = target_skills.get(name)
         target_path = roots[args.target] / name
+        target_occupied = target_path.exists() or target_path.is_symlink()
         if target and target.digest == source.digest:
             print(f"same: {name}")
+            continue
+
+        if target is None and target_occupied and not args.force:
+            conflicts += 1
+            print(
+                f"conflict: {target_path} exists but is not a skill; "
+                "pass --force to replace it after backup"
+            )
             continue
 
         if target and target.digest != source.digest and not args.force:
@@ -862,7 +995,15 @@ def cmd_restore(args: argparse.Namespace) -> int:
             )
             continue
 
-        verb = "replace" if target else "restore"
+        protected = find_protected_entries(target_path) if target_occupied else []
+        if protected:
+            conflicts += 1
+            preview = ", ".join(path.as_posix() for path in protected[:3])
+            suffix = " ..." if len(protected) > 3 else ""
+            print(f"blocked protected files: {args.target}/{name} ({preview}{suffix})")
+            continue
+
+        verb = "replace" if target_occupied else "restore"
         print(f"{verb if args.apply else 'would ' + verb}: {repo}/skills/{args.source}/{name} -> {target_path}")
         actions += 1
 
@@ -900,6 +1041,16 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if not tool_root_exists(args.source, roots):
         print(f"missing source root: {args.source} -> {roots[args.source]}", file=sys.stderr)
         return 1
+    if (
+        args.source != "factory"
+        and args.target != "factory"
+        and roots_are_shared(roots[args.source], roots[args.target])
+    ):
+        print(
+            f"shared root: {args.source} and {args.target} -> {roots[args.source]}; "
+            "nothing to copy"
+        )
+        return 0
     source_skills = discover_skills(args.source, roots)
     target_skills = discover_skills(args.target, roots)
     selected_names = set(args.name or source_skills.keys())
@@ -917,8 +1068,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
         target = target_skills.get(name)
         target_path = roots[args.target] / name
+        target_occupied = target_path.exists() or target_path.is_symlink()
         if target and target.digest == source.digest:
             print(f"same: {name}")
+            continue
+
+        if target is None and target_occupied and not args.force:
+            conflicts += 1
+            print(
+                f"conflict: {target_path} exists but is not a skill; "
+                "pass --force to replace it after backup"
+            )
             continue
 
         if target and target.digest != source.digest and not args.force:
@@ -934,7 +1094,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
             )
             continue
 
-        verb = "replace" if target else "copy"
+        protected = find_protected_entries(target_path) if target_occupied else []
+        if protected:
+            conflicts += 1
+            preview = ", ".join(path.as_posix() for path in protected[:3])
+            suffix = " ..." if len(protected) > 3 else ""
+            print(f"blocked protected files: {args.target}/{name} ({preview}{suffix})")
+            continue
+
+        verb = "replace" if target_occupied else "copy"
         print(f"{verb if args.apply else 'would ' + verb}: {args.source}/{name} -> {target_path}")
         actions += 1
 
@@ -963,6 +1131,133 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_migrate_codex(args: argparse.Namespace) -> int:
+    """Consolidate legacy Codex user skills into the shared agent-skills root."""
+    legacy_root = expand_path(args.legacy_root)
+    shared_root = expand_path(args.shared_root)
+    backup_base = expand_path(args.backup_dir)
+
+    if roots_are_shared(legacy_root, shared_root):
+        print("legacy and shared roots must be different", file=sys.stderr)
+        return 1
+    if not legacy_root.is_dir():
+        print(f"legacy root missing: {legacy_root}; nothing to migrate")
+        return 0
+
+    legacy_skills = discover_flat_skills("codex-legacy", legacy_root)
+    shared_skills = discover_flat_skills("codex", shared_root)
+    selected_names = set(args.name or legacy_skills.keys())
+    plans: list[tuple[Skill, Path, bool]] = []
+    moved = 0
+    duplicates = 0
+    conflicts = 0
+    missing = 0
+
+    for name in sorted(selected_names):
+        source = legacy_skills.get(name)
+        if source is None:
+            missing += 1
+            print(f"missing legacy skill: {name}")
+            continue
+
+        excluded = find_excluded_entries(source.path)
+        if excluded:
+            conflicts += 1
+            preview = ", ".join(path.as_posix() for path in excluded[:3])
+            suffix = " ..." if len(excluded) > 3 else ""
+            print(f"blocked local-only files: {name} ({preview}{suffix})")
+            continue
+
+        target = shared_skills.get(name)
+        target_path = shared_root / name
+        if target is not None and target.digest != source.digest:
+            conflicts += 1
+            print(f"conflict: {name} differs between legacy and shared roots")
+            continue
+        if target is None and (target_path.exists() or target_path.is_symlink()):
+            conflicts += 1
+            print(f"conflict: non-skill target blocks migration: {target_path}")
+            continue
+
+        duplicate = target is not None
+        plans.append((source, target_path, duplicate))
+        verb = "remove duplicate" if duplicate else "move"
+        print(
+            f"{verb if args.apply else 'would ' + verb}: "
+            f"{source.path} -> {target_path}"
+        )
+
+    if not args.apply:
+        moved = sum(1 for _, _, duplicate in plans if not duplicate)
+        duplicates = sum(1 for _, _, duplicate in plans if duplicate)
+        print("dry-run: pass --apply to consolidate Codex skills")
+        print(
+            f"summary: moved={moved} duplicates_removed={duplicates} "
+            f"conflicts={conflicts} missing={missing}"
+        )
+        if conflicts:
+            return 2
+        if missing:
+            return 1
+        return 0
+
+    if conflicts or missing:
+        print("preflight failed: no snapshot or live changes were made")
+        print(
+            f"summary: moved=0 duplicates_removed=0 "
+            f"conflicts={conflicts} missing={missing}"
+        )
+        return 2 if conflicts else 1
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    snapshot_root = backup_base / timestamp / "pre-codex-migration"
+    snapshot_skills = snapshot_root / "legacy"
+    snapshot_sources = sorted(
+        (source for source, _, _ in plans),
+        key=lambda item: item.name,
+    )
+    for source in snapshot_sources:
+        snapshot_path = snapshot_skills / source.name
+        copy_skill(source.path, snapshot_path)
+        if hash_skill(snapshot_path) != source.digest:
+            raise SynchroError(
+                f"snapshot verification failed for {source.name}; no live changes were made"
+            )
+    write_json_atomic(
+        snapshot_root / "snapshot.json",
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "legacy_root": str(legacy_root),
+            "shared_root": str(shared_root),
+            "skills": [
+                {"name": skill.name, "sha256": skill.digest}
+                for skill in snapshot_sources
+            ],
+        },
+    )
+    print(f"snapshot: {legacy_root} -> {snapshot_root}")
+
+    for source, target_path, duplicate in plans:
+        if not duplicate:
+            shared_root.mkdir(parents=True, exist_ok=True)
+            copy_skill(source.path, target_path)
+            if hash_skill(target_path) != source.digest:
+                raise SynchroError(
+                    f"migration verification failed for {source.name}; "
+                    f"restore from {snapshot_root}"
+                )
+            moved += 1
+        else:
+            duplicates += 1
+        remove_path(source.path)
+
+    print(
+        f"summary: moved={moved} duplicates_removed={duplicates} "
+        "conflicts=0 missing=0"
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     roots = roots_from_args(args)
     print(f"synchro: {Path(__file__).resolve().parents[1]}")
@@ -971,8 +1266,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"git: {git or 'missing'}")
     print(f"droid: {droid or 'missing'}")
 
+    unique_tools, aliases = unique_tools_by_root(TOOLS, roots)
+    discovered = {tool: discover_skills(tool, roots) for tool in unique_tools}
     for tool in TOOLS:
-        skills = discover_skills(tool, roots)
+        skills = discovered[aliases.get(tool, tool)]
         root = roots[tool]
         status = "exists" if root.exists() else "missing"
         detail = f"{len(skills)} skills"
@@ -980,6 +1277,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             plugin_count = sum(1 for skill in skills.values() if skill.managed)
             detail = f"{detail}, {plugin_count} plugin-managed"
         print(f"{tool}: {root} ({status}, {detail})")
+        if tool in aliases:
+            print(f"  shared with: {aliases[tool]}")
 
     if roots["factory_plugins"].exists():
         print(f"factory plugins: {roots['factory_plugins']} (exists)")
@@ -1043,6 +1342,17 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--force", action="store_true", help="replace conflicting target skills after backup")
     sync.add_argument("--apply", action="store_true")
     sync.set_defaults(func=cmd_sync)
+
+    migrate = subcommands.add_parser(
+        "migrate-codex",
+        help="consolidate legacy ~/.codex/skills user skills into ~/.agents/skills",
+    )
+    migrate.add_argument("--legacy-root", default=LEGACY_CODEX_ROOT)
+    migrate.add_argument("--shared-root", default=DEFAULT_TOOL_ROOTS["codex"])
+    migrate.add_argument("--name", action="append", help="skill name to migrate; can be repeated")
+    migrate.add_argument("--backup-dir", default="~/.synchro/backups")
+    migrate.add_argument("--apply", action="store_true")
+    migrate.set_defaults(func=cmd_migrate_codex)
 
     doctor = subcommands.add_parser("doctor", help="inspect local Synchro tool roots")
     add_root_args(doctor)
